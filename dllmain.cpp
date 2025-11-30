@@ -873,6 +873,13 @@ void DelayedStart()
 		UpdateMemoryAddress(pHotelMap, &Value, sizeof(Value));
 	}
 
+	// === Set PlayUnusedAudio ===
+	if (PlayUnusedAudio)
+	{
+		PatchUnusedAudio();
+		Logging::Log() << "PlayUnusedAudio monitor thread initialized!";
+	}
+
 	// Flush cache
 	FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
 

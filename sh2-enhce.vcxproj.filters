@@ -485,6 +485,9 @@
     <ClCompile Include="Patches\MusicBoxVolume.cpp">
       <Filter>Patches</Filter>
     </ClCompile>
+    <ClCompile Include="Patches\PlayUnusedAudio.cpp">
+      <Filter>Patches</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common\Settings.h">
@@ -729,6 +732,9 @@
     </ClInclude>
     <ClInclude Include="External\Hooking\Disasm.h">
       <Filter>External\Hooking</Filter>
+    </ClInclude>
+    <ClInclude Include="Patches\PlayUnusedAudio.h">
+      <Filter>Patches</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
