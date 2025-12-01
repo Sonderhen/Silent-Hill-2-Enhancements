@@ -310,8 +310,8 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
     const DWORD addrJapCheck = 0x01B603EC;
     const DWORD addrSub = 0x019BC007;
 
-    const DWORD addrCheck1 = 0x0049FFF8;
-    const DWORD addrCheck2 = 0x005335AC;
+    const DWORD addrCheck1 = 0x01B80BC0;
+    const DWORD addrCheck2 = 0x00644198;
     const DWORD addrEvent = 0x01B5FEC4;
 
     int lastEventValue = 0;
@@ -345,8 +345,8 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
         }
 
         uint8_t  LanguageCheck = *(uint16_t*)(base + addrLanguage);
-        uint16_t vCheck1 = *(uint16_t*)(base + addrCheck1);
-        uint16_t vCheck2 = *(uint16_t*)(base + addrCheck2);
+        uint8_t vCheck1 = *(uint16_t*)(base + addrCheck1);
+        uint8_t vCheck2 = *(uint16_t*)(base + addrCheck2);
 
         // The Japanese language is unique in that some values ??are different, so if the language is Japanese, the rule will change slightly.
 
@@ -402,8 +402,12 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
             }
         }
 
-        if (vCheck1 != 34473 || vCheck2 != 55540)
+
+        WriteLog("DBG: vCheck1=%u, vCheck2=%u, EVENT=%u", vCheck1, vCheck2, ev);
+
+        if (vCheck1 != 96 || vCheck2 != 100)
         {
+            WriteLog("Conditions failed. Reset.");
             StopAlertSound();
             lastEventValue = begintext;
             sequenceIndex = 0;
@@ -414,6 +418,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
 
         if (ev == begintext)
         {
+            WriteLog("EVENT return to 0. Reset.");
             StopAlertSound();
             sequenceIndex = 0;
             lastEventValue = 0;
@@ -423,6 +428,8 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
 
         if (ev != lastEventValue)
         {
+            WriteLog("New event detected: %u ", ev, lastEventValue);
+
             int idx = sequenceIndex;
             if (idx > maxSeq) idx = maxSeq;
 
@@ -438,7 +445,6 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
         Sleep(20);
     }
 }
-
 
 // ======================================================
 // START
