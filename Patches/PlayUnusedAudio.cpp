@@ -310,6 +310,8 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
     const DWORD addrJapCheck = 0x01B603EC;
     const DWORD addrSub = 0x019BC007;
 
+    const DWORD addrStartLetter = 0x01B7A944;
+
     const DWORD addrCheck1 = 0x01B80BC0;
     const DWORD addrCheck2 = 0x00644198;
     const DWORD addrEvent = 0x01B5FEC4;
@@ -324,6 +326,8 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
     uint16_t ev;
     uint16_t begintext;
 
+    static bool startLetterTriggered = false;
+
     while (true)
     {
         //--------------------------------------------------------
@@ -331,6 +335,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
         //--------------------------------------------------------
 
         uint8_t ready = *(uint8_t*)(base + addrReadyCheck);
+        uint8_t StartLetter = *(uint8_t*)(base + addrStartLetter);
 
         if (ready != 152)
         {
@@ -344,9 +349,37 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
             continue;
         }
 
-        uint8_t  LanguageCheck = *(uint16_t*)(base + addrLanguage);
+        uint8_t  LanguageCheck = *(uint8_t*)(base + addrLanguage);
         uint8_t vCheck1 = *(uint16_t*)(base + addrCheck1);
         uint8_t vCheck2 = *(uint16_t*)(base + addrCheck2);
+
+        if (!startLetterTriggered)
+        {
+            if (StartLetter == 3)
+            {
+                startLetterTriggered = true;
+                WriteLog("StartLetter == 3 detected. Continuing normally...");
+            }
+            else
+            {
+                WriteLog("StartLetter is not 3. current=%u", StartLetter);
+                Sleep(20);
+                continue;
+            }
+        }
+
+        if (ready != 152)
+        {
+            WriteLog("READY lost! Returning to initial state.");
+
+            StopAlertSound();
+            startLetterTriggered = false;
+            lastEventValue = 0;
+            sequenceIndex = 0;
+
+            Sleep(200);
+            continue;
+        }
 
         // The Japanese language is unique in that some values ??are different, so if the language is Japanese, the rule will change slightly.
 
@@ -402,7 +435,6 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
             }
         }
 
-
         WriteLog("DBG: vCheck1=%u, vCheck2=%u, EVENT=%u", vCheck1, vCheck2, ev);
 
         if (vCheck1 != 96 || vCheck2 != 100)
@@ -411,6 +443,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
             StopAlertSound();
             lastEventValue = begintext;
             sequenceIndex = 0;
+            startLetterTriggered = false;
 
             Sleep(200);
             continue;
