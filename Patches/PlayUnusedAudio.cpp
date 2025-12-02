@@ -350,8 +350,8 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
         }
 
         uint8_t  LanguageCheck = *(uint8_t*)(base + addrLanguage);
-        uint8_t vCheck1 = *(uint16_t*)(base + addrCheck1);
-        uint8_t vCheck2 = *(uint16_t*)(base + addrCheck2);
+        uint8_t vCheck1 = *(uint8_t*)(base + addrCheck1);
+        uint8_t vCheck2 = *(uint8_t*)(base + addrCheck2);
 
         if (!startLetterTriggered)
         {
