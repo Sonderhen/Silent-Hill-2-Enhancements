@@ -6,14 +6,15 @@
 #include <cstdio>
 
 #include "Common/Settings.h"
+#include "Patches.h"
+#include "InputTweaks.h"
+
+static DWORD* textscreen = nullptr;
+static DWORD lastTextValue = 0;
 
 #pragma comment(lib, "winmm.lib")
 
-struct AfsEntry
-{
-    uint32_t offset;
-    uint32_t size;
-};
+struct AfsEntry { uint32_t offset; uint32_t size; };
 
 static std::string g_dllDir;
 static std::string g_logPath;
@@ -28,14 +29,50 @@ static BYTE* g_waveData = NULL;
 
 static volatile LONG gStarted = 0;
 
-// ======================================================
-// LOG
-// ======================================================
+static const int SEQ_COUNT = 12;
+static const int MAX_SEQ_IDX = 11; // last usable index in table
+
+static void WriteLog(const char* fmt, ...);
+static void StopAlertSound();
+static bool LoadFileToMemory(const std::string& path, BYTE** outBuf, size_t* outSize);
+static void ApplyGameMasterVolume();
+static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec, float endSec);
+static void InitVoiceAFS();
+static bool PlayVoiceAfs(uint32_t index, float startSec, float endSec);
+
+static void ResetState(int& sequenceIndex, bool& active, bool& initializedAfterStart)
+{
+    StopAlertSound();
+    sequenceIndex = 0;
+    lastTextValue = 0;
+    active = false;
+    initializedAfterStart = false;
+}
+
+static void LoadSequenceTables(float* outStart, float* outEnd, int& outMax)
+{
+    static const float start[SEQ_COUNT] = { 0.0f,7.2f,13.0f,17.1f,19.2f,22.5f,35.2f,47.2f,53.4f,61.2f,64.0f, 0.0f };
+    static const float end[SEQ_COUNT] = { 7.0f,12.4f,16.9f,19.0f,22.0f,34.5f,46.2f,52.2f,60.2f,63.5f,67.2f, 0.0f };
+
+    memcpy(outStart, start, sizeof(float) * SEQ_COUNT);
+    memcpy(outEnd, end, sizeof(float) * SEQ_COUNT);
+    outMax = MAX_SEQ_IDX;
+}
+
+static bool ShouldActivateSequence(DWORD room, DWORD cutscene, DWORD fade, float cutsceneTime)
+{
+    return (room == R_HTL_RESTAURANT && cutscene == CS_HTL_LAURA_PIANO && fade == 3 && cutsceneTime == 1678.000000);
+}
+
+static DWORD ReadTextscreenSafe()
+{
+    if (!textscreen) return 0;
+    return *textscreen;
+}
+
 static void WriteLog(const char* fmt, ...)
 {
-    //Logs will only be generated if the PlayUnusedAudio.log file already exists.
-    if (!g_enableLog)
-        return;
+    if (!g_enableLog) return;
 
     char buf[1024];
     va_list ap;
@@ -44,38 +81,23 @@ static void WriteLog(const char* fmt, ...)
     va_end(ap);
 
     std::ofstream f(g_logPath, std::ios::app);
-    if (f.is_open())
-    {
-        f << buf << "\n";
-        f.close();
-    }
+    if (f.is_open()) { f << buf << "\n"; f.close(); }
 }
 
-// ======================================================
-// STOP AUDIO
-// ======================================================
+
 static void StopAlertSound()
 {
     if (g_waveOut && g_waveHeader)
     {
         waveOutReset(g_waveOut);
         waveOutUnprepareHeader(g_waveOut, g_waveHeader, sizeof(WAVEHDR));
-        delete g_waveHeader;
-        g_waveHeader = NULL;
-
+        delete g_waveHeader; g_waveHeader = NULL;
         WriteLog("Sound stopped.");
     }
 
-    if (g_waveData)
-    {
-        delete[] g_waveData;
-        g_waveData = NULL;
-    }
+    if (g_waveData) { delete[] g_waveData; g_waveData = NULL; }
 }
 
-// ======================================================
-// LOAD FILE TO MEMORY
-// ======================================================
 static bool LoadFileToMemory(const std::string& path, BYTE** outBuf, size_t* outSize)
 {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -88,64 +110,35 @@ static bool LoadFileToMemory(const std::string& path, BYTE** outBuf, size_t* out
     f.seekg(0);
     f.read((char*)buf, size);
 
-    if (!f)
-    {
-        delete[] buf;
-        return false;
-    }
+    if (!f) { delete[] buf; return false; }
 
-    *outBuf = buf;
-    *outSize = size;
-    return true;
+    *outBuf = buf; *outSize = size; return true;
 }
 
 static void ApplyGameMasterVolume()
 {
-    //It will play the audio at the volume specified by MasterVolume.
-
     int level = ConfigData.VolumeLevel;
-    if (level < 0) level = 0;
-    if (level > 15) level = 15;
-
+    if (level < 0) level = 0; if (level > 15) level = 15;
     int percent = (int)((level / 15.0f) * 100.0f);
-
     DWORD vol = (DWORD)(65535 * (percent / 100.0f));
     DWORD stereoVol = (vol << 16) | vol;
-
     waveOutSetVolume(0, stereoVol);
-
     WriteLog("Master volume applied (SH2EE): %d%%  (level=%d)", percent, level);
 }
 
-// ======================================================
-// PLAY WAV FROM MEMORY RANGE
-// ======================================================
 static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec, float endSec)
 {
     StopAlertSound();
 
-    if (!wavBuf || wavSize < 44)
-    {
-        WriteLog("Invalid WAV.");
-        return;
-    }
+    if (!wavBuf || wavSize < 44) { WriteLog("Invalid WAV."); return; }
 
     g_waveData = new BYTE[wavSize];
     memcpy(g_waveData, wavBuf, wavSize);
 
-    uint32_t fmtSize;
-    memcpy(&fmtSize, g_waveData + 16, sizeof(fmtSize));
-
+    uint32_t fmtSize; memcpy(&fmtSize, g_waveData + 16, sizeof(fmtSize));
     WAVEFORMATEX* wf = (WAVEFORMATEX*)(g_waveData + 20);
     DWORD dataPos = 20 + fmtSize + 8;
-
-    if (dataPos >= wavSize)
-    {
-        WriteLog("Unexpected WAV format.");
-        delete[] g_waveData;
-        g_waveData = NULL;
-        return;
-    }
+    if (dataPos >= wavSize) { WriteLog("Unexpected WAV format."); delete[] g_waveData; g_waveData = NULL; return; }
 
     BYTE* audioPtr = g_waveData + dataPos;
     DWORD audioSize = (DWORD)(wavSize - dataPos);
@@ -154,9 +147,7 @@ static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec,
     DWORD startByte = (DWORD)(startSec * wf->nSamplesPerSec * bytesPerSample);
     DWORD endByte = (DWORD)(endSec * wf->nSamplesPerSec * bytesPerSample);
 
-    if (startByte > audioSize) startByte = 0;
-    if (endByte > audioSize) endByte = audioSize;
-
+    if (startByte > audioSize) startByte = 0; if (endByte > audioSize) endByte = audioSize;
     DWORD playBytes = endByte - startByte;
 
     if (!g_waveOut)
@@ -164,103 +155,36 @@ static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec,
         if (waveOutOpen(&g_waveOut, WAVE_MAPPER, wf, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR)
         {
             WriteLog("waveOutOpen failed.");
-            g_waveOut = NULL;
-            delete[] g_waveData;
-            g_waveData = NULL;
-            return;
+            g_waveOut = NULL; delete[] g_waveData; g_waveData = NULL; return;
         }
-
         WriteLog("waveOutOpen initialized.");
     }
 
-    g_waveHeader = new WAVEHDR();
-    memset(g_waveHeader, 0, sizeof(WAVEHDR));
-
+    g_waveHeader = new WAVEHDR(); memset(g_waveHeader, 0, sizeof(WAVEHDR));
     g_waveHeader->lpData = (LPSTR)(audioPtr + startByte);
     g_waveHeader->dwBufferLength = playBytes;
 
-    if (EnableMasterVolume)
-        ApplyGameMasterVolume();
-
-    // If Master Volume is disabled, the audio volume will be 100 % .
-    else
-        waveOutSetVolume(0, 0xFFFFFFFF);
+    if (EnableMasterVolume) ApplyGameMasterVolume(); else waveOutSetVolume(0, 0xFFFFFFFF);
 
     waveOutPrepareHeader(g_waveOut, g_waveHeader, sizeof(WAVEHDR));
     waveOutWrite(g_waveOut, g_waveHeader, sizeof(WAVEHDR));
 }
 
-// ======================================================
-// PLAY FROM AFS BY OFFSET/SIZE
-// ======================================================
-static void PlayAFSByOffset(uint32_t offset, uint32_t size, float startSec, float endSec)
-{
-    WriteLog("PlayAFSByOffset: offset=0x%X size=%u", offset, size);
-
-    std::ifstream f(voicepath, std::ios::binary);
-    if (!f.is_open())
-    {
-        WriteLog("ERROR: Failed to open AFS.");
-        return;
-    }
-
-    if ((uint64_t)offset + size > (uint64_t)SIZE_MAX)
-    {
-        WriteLog("ERROR: offset+size overflow.");
-        return;
-    }
-
-    f.seekg(offset, std::ios::beg);
-
-    BYTE* block = new BYTE[size];
-    f.read((char*)block, size);
-
-    if (!f)
-    {
-        WriteLog("Error reading WAV block from AFS.");
-        delete[] block;
-        return;
-    }
-
-    PlayWavFromMemoryRange(block, size, startSec, endSec);
-
-    delete[] block;
-}
-
 static void InitVoiceAFS()
 {
-    BYTE* buf = nullptr;
-    size_t sz = 0;
+    BYTE* buf = nullptr; size_t sz = 0;
+    if (!LoadFileToMemory(voicepath, &buf, &sz)) { WriteLog("InitVoiceAFS: failed to open AFS file."); return; }
 
-    if (!LoadFileToMemory(voicepath, &buf, &sz))
-    {
-        WriteLog("InitVoiceAFS: failed to open AFS file.");
-        return;
-    }
-
-    if (sz < 16 || memcmp(buf, "AFS\0", 4) != 0)
-    {
-        WriteLog("InitVoiceAFS: invalid AFS file.");
-        delete[] buf;
-        return;
-    }
+    if (sz < 16 || memcmp(buf, "AFS\0", 4) != 0) { WriteLog("InitVoiceAFS: invalid AFS file."); delete[] buf; return; }
 
     uint32_t fileCount = *(uint32_t*)(buf + 4);
     WriteLog("InitVoiceAFS: fileCount=%u", fileCount);
 
-    size_t tableStart = 8;
-    size_t tableSize = fileCount * 8;
-
-    if (tableStart + tableSize > sz)
-    {
-        WriteLog("InitVoiceAFS: offset/size table exceeds file size.");
-        delete[] buf;
-        return;
-    }
+    size_t tableStart = 8; size_t tableSize = fileCount * 8;
+    if (tableStart + tableSize > sz) { WriteLog("InitVoiceAFS: offset/size table exceeds file size."); delete[] buf; return; }
 
     g_afsTable.resize(fileCount);
-
-    for (uint32_t i = 0; i < fileCount; i++)
+    for (uint32_t i = 0; i < fileCount; ++i)
     {
         size_t p = tableStart + i * 8;
         g_afsTable[i].offset = *(uint32_t*)(buf + p);
@@ -268,26 +192,25 @@ static void InitVoiceAFS()
     }
 
     delete[] buf;
-
     WriteLog("InitVoiceAFS: offset/size table loaded.");
 }
 
-// ======================================================
-// PLAY BY INDEX
-// ======================================================
-static void PlayByIndex(uint32_t index, float startSec, float endSec)
+static bool PlayVoiceAfs(uint32_t index, float startSec, float endSec)
 {
-    if (index >= g_afsTable.size())
-    {
-        WriteLog("Index out of range: %u", index);
-        return;
-    }
-
+    if (index >= g_afsTable.size()) { WriteLog("PlayVoiceAfs ERROR: invalid index %u", index); return false; }
     const AfsEntry& e = g_afsTable[index];
+    WriteLog("PlayVoiceAfs: index=%u offset=0x%X size=%u", index, e.offset, e.size);
 
-    WriteLog("PlayByIndex: index=%u offset=0x%X size=%u", index, e.offset, e.size);
+    std::ifstream f(voicepath, std::ios::binary);
+    if (!f.is_open()) { WriteLog("PlayVoiceAfs ERROR: cannot open AFS."); return false; }
 
-    PlayAFSByOffset(e.offset, e.size, startSec, endSec);
+    f.seekg(e.offset, std::ios::beg);
+    BYTE* wavData = new BYTE[e.size];
+    f.read((char*)wavData, e.size);
+    if (!f) { WriteLog("PlayVoiceAfs ERROR: reading block failed."); delete[] wavData; return false; }
+
+    PlayWavFromMemoryRange(wavData, e.size, startSec, endSec);
+    delete[] wavData; return true;
 }
 
 DWORD WINAPI AudioMonitorThread(LPVOID)
@@ -295,233 +218,155 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
     Sleep(3000);
     WriteLog("AudioMonitorThread started.");
 
-    HMODULE hGame = GetModuleHandleA("sh2pc.exe");
-    if (!hGame)
-    {
-        WriteLog("Could not find sh2pc.exe.");
-        return 0;
-    }
-
-    BYTE* base = (BYTE*)hGame;
-
-    const DWORD addrReadyCheck = 0x006C7228;
-
-    const DWORD addrLanguage = 0x00532B5C;
-    const DWORD addrJapCheck = 0x01B603EC;
-    const DWORD addrSub = 0x019BC007;
-
-    const DWORD addrStartLetter = 0x01B7A944;
-
-    const DWORD addrCheck1 = 0x01B80BC0;
-    const DWORD addrCheck2 = 0x00644198;
-    const DWORD addrEvent = 0x01B5FEC4;
-
-    int lastEventValue = 0;
     int sequenceIndex = 0;
-
-    float seqStart[12];
-    float seqEnd[12];
-    int   maxSeq;
-
-    uint16_t ev;
-    uint16_t begintext;
-
-    static bool startLetterTriggered = false;
+    float seqStart[SEQ_COUNT]; float seqEnd[SEQ_COUNT]; int maxSeq;
+    bool active = false;
+    bool initializedAfterStart = false;
 
     while (true)
     {
-        //--------------------------------------------------------
-        // Before checking other addresses and values, verify that the current room is the hotel's restaurant.
-        //--------------------------------------------------------
+        DWORD room = GetRoomID();
+        DWORD cutscene = GetCutsceneID();
+        DWORD fade = GetTransitionState();
+        float cutsceneTime = GetCutsceneTimer();
+        WriteLog("Cutscene Time = %f", cutsceneTime);
 
-        uint8_t ready = *(uint8_t*)(base + addrReadyCheck);
-        uint8_t StartLetter = *(uint8_t*)(base + addrStartLetter);
-
-        if (ready != 152)
+        // quick out if not in room
+        if (room != R_HTL_RESTAURANT)
         {
-            StopAlertSound();
-            lastEventValue = 0;
-            sequenceIndex = 0;
-
-            WriteLog("Waiting for value 152 at 6C7228... (current value=%u)", ready);
-
+            ResetState(sequenceIndex, active, initializedAfterStart);
             Sleep(5000);
+            WriteLog("Room: %u (not restaurant). Reset state and sleeping.", room);
             continue;
         }
 
-        uint8_t  LanguageCheck = *(uint8_t*)(base + addrLanguage);
-        uint8_t vCheck1 = *(uint8_t*)(base + addrCheck1);
-        uint8_t vCheck2 = *(uint8_t*)(base + addrCheck2);
+        // load sequence tables
+        LoadSequenceTables(seqStart, seqEnd, maxSeq);
 
-        if (!startLetterTriggered)
+        // Activate sequence only when both cutscene and fade conditions are met
+        if (!active)
         {
-            if (StartLetter == 3)
+            if (ShouldActivateSequence(room, cutscene, fade, cutsceneTime))
             {
-                startLetterTriggered = true;
-                WriteLog("StartLetter == 3 detected. Continuing normally...");
+                WriteLog("Activation: room, cutscene, fade, and CutsceneTime OK. Enabling sequence.");
+                active = true; sequenceIndex = 0; initializedAfterStart = false; lastTextValue = 0;
+                Sleep(20);
+                continue;
             }
             else
             {
-                WriteLog("StartLetter is not 3. current=%u", StartLetter);
+                WriteLog("Waiting conditions: room=%u cutscene=%u fade=%u cutsceneTime=%u", room, cutscene, fade, cutsceneTime);
                 Sleep(20);
                 continue;
             }
         }
 
-        if (ready != 152)
+        // Ensure cutscene still correct while active; if not, reset and wait for next activation
+        if (cutscene != CS_HTL_LAURA_PIANO || cutsceneTime != 1678.000000)
         {
-            WriteLog("READY lost! Returning to initial state.");
+            // During testing, the Cutscene value for a frame may be incorrectly declared as 0. To prevent this, the Cutscene value will be retrieved again.
+            Sleep(30);
+            DWORD cut2 = GetCutsceneID();
+            float cutTime2 = GetCutsceneTimer();
 
-            StopAlertSound();
-            startLetterTriggered = false;
-            lastEventValue = 0;
-            sequenceIndex = 0;
-
-            Sleep(200);
-            continue;
-        }
-
-        // The Japanese language is unique in that some values ??are different, so if the language is Japanese, the rule will change slightly.
-
-        if (LanguageCheck != 232)
-        {
-            WriteLog("Language is NOT Japanese.");
-            ev = *(uint16_t*)(base + addrEvent);
-            begintext = 0;
-
-            float startEng[11] =
-            { 0.0f,7.2f,13.0f,17.1f,19.2f,22.5f,35.2f,47.2f,53.4f,61.0f,64.0f };
-
-            float endEng[11] =
-            { 7.0f,12.4f,16.9f,19.0f,22.0f,34.5f,46.2f,52.2f,60.2f,63.5f,67.2f };
-
-            memcpy(seqStart, startEng, sizeof(startEng));
-            memcpy(seqEnd, endEng, sizeof(endEng));
-            maxSeq = 10;
-        }
-        else
-        {
-            WriteLog("Language is Japanese.");
-            ev = *(uint16_t*)(base + addrJapCheck);
-            begintext = 44906;
-
-            uint8_t SubCheck = *(uint16_t*)(base + addrSub);
-
-            if (SubCheck == 0)
+            if (cutscene != CS_HTL_LAURA_PIANO || cutsceneTime != 1678.000000)
             {
-                WriteLog("Subtitles OFF.");
-                float startJap[12] =
-                { 0.0f,0.0f,7.2f,13.0f,17.1f,19.2f,22.5f,35.2f,47.2f,53.4f,61.0f,64.0f };
-
-                float endJap[12] =
-                { 0.0f,6.2f,12.4f,16.5f,19.0f,22.0f,34.5f,46.2f,52.2f,60.2f,63.0f,67.2f };
-
-                memcpy(seqStart, startJap, sizeof(startJap));
-                memcpy(seqEnd, endJap, sizeof(endJap));
-                maxSeq = 11;
+                WriteLog("Cutscene or Timer changed: cutscene=%u cutsceneTime=%u", cutscene, cutsceneTime);
+                ResetState(sequenceIndex, active, initializedAfterStart);
+                continue;
             }
-            else
-            {
-                WriteLog("Subtitles ON.");
-                float startJap[11] =
-                { 0.0f,7.2f,13.0f,17.1f,19.2f,22.5f,35.2f,47.2f,53.4f,61.0f,64.0f };
 
-                float endJap[11] =
-                { 6.2f,12.4f,16.5f,19.0f,22.0f,34.5f,46.2f,52.2f,60.2f,63.0f,67.2f };
-
-                memcpy(seqStart, startJap, sizeof(startJap));
-                memcpy(seqEnd, endJap, sizeof(endJap));
-                maxSeq = 10;
-            }
+            // It was a false positive.
+            WriteLog("false positive: cutscene=%u stabilizedCutscene=%u cutscenetime=%u stabilizedCutsceneTime=%u ", cutscene, cut2, cutTime2);
         }
 
-        WriteLog("DBG: vCheck1=%u, vCheck2=%u, EVENT=%u", vCheck1, vCheck2, ev);
+        // safe read
+        DWORD value = ReadTextscreenSafe();
 
-        if (vCheck1 != 96 || vCheck2 != 100)
+        // first read after activation only initializes lastTextValue
+        if (!initializedAfterStart)
         {
-            WriteLog("Conditions failed. Reset.");
-            StopAlertSound();
-            lastEventValue = begintext;
-            sequenceIndex = 0;
-            startLetterTriggered = false;
-
-            Sleep(200);
-            continue;
-        }
-
-        if (ev == begintext)
-        {
-            WriteLog("EVENT return to 0. Reset.");
-            StopAlertSound();
-            sequenceIndex = 0;
-            lastEventValue = 0;
+            WriteLog("[INIT] First read after activation: lastTextValue=%u", value);
+            lastTextValue = value;
+            initializedAfterStart = true;
             Sleep(20);
             continue;
         }
 
-        if (ev != lastEventValue)
+        // play on change (non-zero and different)
+        if (value != 0 && value != lastTextValue)
         {
-            WriteLog("New event detected: %u ", ev, lastEventValue);
+            WriteLog("[PLAY] Change detected: last=%u : value=%u (seq=%d)", lastTextValue, value, sequenceIndex);
 
-            int idx = sequenceIndex;
-            if (idx > maxSeq) idx = maxSeq;
+            // Only play the audio if the current sequence is smaller than the maximum sequence.
+            if (sequenceIndex <= maxSeq)
+                PlayVoiceAfs(119, seqStart[sequenceIndex], seqEnd[sequenceIndex]);
 
-            PlayByIndex(119, seqStart[idx], seqEnd[idx]);
-
+            lastTextValue = value;
             sequenceIndex++;
-            if (sequenceIndex > maxSeq)
-                sequenceIndex = maxSeq;
+        }
+        else
+        {
+            WriteLog("[NOCHANGE] value=%u | last=%u", value, lastTextValue);
+        }
 
-            lastEventValue = ev;
+        // if we finished all sequences, wait until cutscene OR room change, then reset and require new activation
+        if (sequenceIndex > maxSeq)
+        {
+            WriteLog("[END] Final sequence reached. Stopping audio and waiting for room/cutscene change...");
+            StopAlertSound();
+
+            while (true)
+            {
+                DWORD curRoom = GetRoomID(); DWORD curCut = GetCutsceneID();
+                if (curRoom != R_HTL_RESTAURANT || curCut != CS_HTL_LAURA_PIANO)
+                {
+                    WriteLog("[RESET] Room/Cutscene changed: curRoom=%u curCut=%u. Resetting.", curRoom, curCut);
+                    break;
+                }
+                Sleep(200);
+            }
+
+            ResetState(sequenceIndex, active, initializedAfterStart);
+            WriteLog("[RESET] Values reset. Waiting for next activation (fade==3).");
+            continue;
         }
 
         Sleep(20);
     }
 }
 
-// ======================================================
-// START
-// ======================================================
 void PatchUnusedAudio()
 {
-    if (InterlockedExchange(&gStarted, 1) != 0) return;
+    // LOCATE TARGET ADDRESS
+    BYTE pattern[] = { 0xA3, 0xEC, 0x03, 0xF6, 0x01 };
+    BYTE* addr = (BYTE*)SearchAndGetAddresses(
+        0x0048042F, 0x004806AF, 0x0047FE3F,
+        pattern, sizeof(pattern), 0, __FUNCTION__);
 
-    char path[MAX_PATH];
-    GetModuleFileNameA(NULL, path, MAX_PATH);
-
-    std::string s = path;
-    size_t p = s.find_last_of("\\/");
-    if (p != std::string::npos) s = s.substr(0, p);
-
-    g_dllDir = s;
-
-    //Logs will only be generated if the PlayUnusedAudio.log file already exists.
-    g_logPath = g_dllDir + "\\PlayUnusedAudio.log";
-
+    if (!addr) WriteLog("ERROR: Could not locate sh2pc.exe+1B603EC through pattern scan!");
+    else
     {
-        std::ifstream lf(g_logPath);
-        g_enableLog = lf.is_open();
+        textscreen = (DWORD*)(*(DWORD*)(addr + 1));
+        WriteLog("Found target address = %p", textscreen);
     }
 
+    if (InterlockedExchange(&gStarted, 1) != 0) return;
+
+    char path[MAX_PATH]; GetModuleFileNameA(NULL, path, MAX_PATH);
+    std::string s = path; size_t p = s.find_last_of("\\/"); if (p != std::string::npos) s = s.substr(0, p);
+    g_dllDir = s; g_logPath = g_dllDir + "\\PlayUnusedAudio.log";
+
+    { std::ifstream lf(g_logPath); g_enableLog = lf.is_open(); }
     WriteLog("Starting PlayUnusedAudio...");
 
-    // AFS path
     voicepath = g_dllDir + "\\sh2e\\sound\\adx\\voice\\voice.afs";
-
-    // Checks if afs exists
     {
         std::ifstream test(voicepath, std::ios::binary);
-        if (!test.is_open())
-        {
-            WriteLog("voice.afs NOT found: %s", voicepath.c_str());
-            WriteLog("Monitor will not start. Restart the game and try again.");
-            return;
-        }
+        if (!test.is_open()) { WriteLog("voice.afs NOT found: %s", voicepath.c_str()); WriteLog("Monitor will not start. Restart the game and try again."); return; }
     }
 
     WriteLog("AFS file found. Continuing...");
-
     InitVoiceAFS();
-
     CreateThread(NULL, 0, AudioMonitorThread, NULL, 0, NULL);
 }
