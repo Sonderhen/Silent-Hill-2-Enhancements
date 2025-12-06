@@ -385,7 +385,6 @@ copy /Y "$(ProjectDir)Resources\SH2EEsetup.exe" "$(TargetDir)" &gt;nul</Command>
     <ClInclude Include="Patches\FullscreenImages.h" />
     <ClInclude Include="Patches\InputTweaks.h" />
     <ClInclude Include="Patches\OptionsMenuTweaks.h" />
-    <ClInclude Include="Patches\PlayUnusedAudio.h" />
     <ClInclude Include="Patches\PuzzleAlignmentFixes.h" />
     <ClInclude Include="Patches\ModelID.h" />
     <ClInclude Include="Patches\Patches.h" />

@@ -9,6 +9,39 @@
 #include "Patches.h"
 #include "InputTweaks.h"
 #include <shlwapi.h>
+
+template <typename T>
+struct ComReleaser
+{
+    T* ptr;
+
+    ComReleaser(T* p = nullptr) : ptr(p) {}
+
+    ~ComReleaser()
+    {
+        if (ptr)
+        {
+            ptr->Release();
+            ptr = nullptr;
+        }
+    }
+
+    // Conversion to raw pointer
+    operator T* () const { return ptr; }
+
+    T** operator&() { return &ptr; }
+
+    T* operator->() const { return ptr; }
+};
+
+// RAII for critical section
+struct AutoLock
+{
+    CRITICAL_SECTION* cs;
+    AutoLock(CRITICAL_SECTION* c) : cs(c) { EnterCriticalSection(cs); }
+    ~AutoLock() { LeaveCriticalSection(cs); }
+};
+
 void PatchUnusedAudio();
 extern "C" HRESULT WINAPI DSOAL_DirectSoundCreate8(LPCGUID lpcGUID, IDirectSound8** ppDS, IUnknown* pUnkOuter);
 
@@ -25,7 +58,6 @@ static std::string voicepath;
 static bool g_enableLog = false;
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 
-// --- novos globals (colocar depois dos outros statics) ---
 static IDirectSound8* g_pDS = nullptr;
 static IDirectSoundBuffer* g_pBuffer = nullptr;
 static CRITICAL_SECTION g_audioLock;
@@ -57,14 +89,13 @@ static void StopAlertSound()
     {
         // try stop
         g_pBuffer->Stop();
-        // unlock/restore not needed because we locked/unlocked earlier
         g_pBuffer->Release();
         g_pBuffer = nullptr;
         WriteLog("StopCurrentPlayback: buffer stopped and released.");
     }
 }
 
-// Inicializa device DirectSound global (só na primeira vez)
+// Inicializa device DirectSound global
 static bool EnsureDirectSoundInitialized()
 {
     if (!g_audioLockInitialized)
@@ -108,7 +139,6 @@ static bool LoadFileToMemory(const std::string& path, BYTE** outBuf, size_t* out
 
 static void ApplyGameMasterVolume(BYTE* buffer, DWORD sizeBytes, float volume)
 {
-    // volume: 0.0f a 1.0f
     short* samples = (short*)buffer;
     DWORD sampleCount = sizeBytes / sizeof(short);
 
@@ -121,78 +151,66 @@ static void ApplyGameMasterVolume(BYTE* buffer, DWORD sizeBytes, float volume)
     }
 }
 
-// Reproduz um bloco PCM (dados raw) via DirectSound create + buffer secundário.
-// wf: formato (WAVEFORMATEX), audioData: ponteiro para pcm (somente data chunk), audioSize: bytes
 static bool PlayWavWithDirectSound(const WAVEFORMATEX* wf, const BYTE* audioData, DWORD audioSize)
 {
-    if (!wf || !audioData || audioSize == 0) return false;
+    if (!wf || !audioData || audioSize == 0)
+        return false;
 
-    if (!EnsureDirectSoundInitialized()) return false;
+    if (!EnsureDirectSoundInitialized())
+        return false;
 
-    EnterCriticalSection(&g_audioLock);
+    AutoLock lock(&g_audioLock);
 
-    // Se já houver reprodução ativa, pare e libere antes
     if (g_pBuffer)
     {
-        WriteLog("PlayWavWithDirectSound: stopping previous buffer before new playback.");
         g_pBuffer->Stop();
         g_pBuffer->Release();
         g_pBuffer = nullptr;
     }
 
-    // Preparar DSBUFFERDESC para buffer secundário
-    DSBUFFERDESC dsbd;
-    ZeroMemory(&dsbd, sizeof(dsbd));
-    dsbd.dwSize = sizeof(dsbd);
-    // deixar flags compatíveis; se quiser controle de pan/vol usar DSBCAPS_CTRLVOLUME | etc
-    dsbd.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_LOCSOFTWARE | DSBCAPS_GLOBALFOCUS;
-    dsbd.dwBufferBytes = audioSize;
-    dsbd.lpwfxFormat = (LPWAVEFORMATEX)wf;
+    DSBUFFERDESC desc = {};
+    desc.dwSize = sizeof(desc);
+    desc.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_LOCSOFTWARE | DSBCAPS_GLOBALFOCUS;
+    desc.dwBufferBytes = audioSize;
+    desc.lpwfxFormat = (LPWAVEFORMATEX)wf;
 
-    IDirectSoundBuffer* pBuffer = nullptr;
-    HRESULT hr = g_pDS->CreateSoundBuffer(&dsbd, &pBuffer, nullptr);
-    if (FAILED(hr) || !pBuffer)
+    // RAII for new buffer
+    ComReleaser<IDirectSoundBuffer> localBuffer;
+
+    HRESULT hr = g_pDS->CreateSoundBuffer(&desc, &localBuffer, nullptr);
+    if (FAILED(hr))
     {
         WriteLog("PlayWavWithDirectSound: CreateSoundBuffer failed (hr=0x%08X)", (unsigned)hr);
-        LeaveCriticalSection(&g_audioLock);
         return false;
     }
 
-    // Lock, copy dados
-    void* p1 = nullptr; DWORD l1 = 0; void* p2 = nullptr; DWORD l2 = 0;
-    hr = pBuffer->Lock(0, audioSize, &p1, &l1, &p2, &l2, 0);
+    void* p1; DWORD b1;
+    void* p2; DWORD b2;
+
+    hr = localBuffer->Lock(0, audioSize, &p1, &b1, &p2, &b2, 0);
     if (FAILED(hr))
     {
         WriteLog("PlayWavWithDirectSound: Lock failed (hr=0x%08X)", (unsigned)hr);
-        pBuffer->Release();
-        LeaveCriticalSection(&g_audioLock);
         return false;
     }
 
-    if (p1 && l1) memcpy(p1, audioData, l1);
-    if (p2 && l2) memcpy(p2, audioData + l1, l2);
-    pBuffer->Unlock(p1, l1, p2, l2);
+    if (p1 && b1) memcpy(p1, audioData, b1);
+    if (p2 && b2) memcpy(p2, audioData + b1, b2);
 
-    // armazenar buffer global e tocar (não bloqueante)
-    g_pBuffer = pBuffer;
+    localBuffer->Unlock(p1, b1, p2, b2);
 
-    // (opcional) ajustar volume do buffer localmente se desejado (DSBVOLUME_MIN .. 0)
-    // pBuffer->SetVolume(0);
-
-    hr = g_pBuffer->Play(0, 0, 0); // não loop
+    hr = localBuffer->Play(0, 0, 0);
     if (FAILED(hr))
     {
         WriteLog("PlayWavWithDirectSound: Play failed (hr=0x%08X)", (unsigned)hr);
-        g_pBuffer->Release();
-        g_pBuffer = nullptr;
-        LeaveCriticalSection(&g_audioLock);
         return false;
     }
 
-    WriteLog("PlayWavWithDirectSound: started playback (audioSize=%u)", audioSize);
+    // Transfer ownership
+    g_pBuffer = localBuffer.ptr;
+    localBuffer.ptr = nullptr;
 
-    // NÃO esperar — retornamos imediatamente para permitir novas chamadas que chamem StopCurrentPlayback()
-    LeaveCriticalSection(&g_audioLock);
+    WriteLog("PlayWavWithDirectSound: playback OK (%u bytes).", audioSize);
     return true;
 }
 
@@ -327,14 +345,22 @@ static void LoadSequenceTables(float* outStart, float* outEnd, int& outMax)
 
 static bool ShouldActivateSequence(DWORD room, DWORD cutscene, DWORD fade, float cutsceneTime)
 {
-    return (room == R_HTL_RESTAURANT && cutscene == CS_HTL_LAURA_PIANO && fade == 3 && cutsceneTime == 1678.000000);
+    return (room == R_HTL_RESTAURANT && cutscene == CS_HTL_LAURA_PIANO && fade == 3 && cutsceneTime >= 1600.000000);
 }
 
 static bool StabilizeCutscene() {
-    if (GetCutsceneID() == CS_HTL_LAURA_PIANO && GetCutsceneTimer() >= 1600.0f)
-        return true;
+    bool first = (GetCutsceneID() == CS_HTL_LAURA_PIANO && GetCutsceneTimer() >= 1600.0f);
+    if (first) return true;
+
+    WriteLog("Cutscene changed — performing additional check...");
     Sleep(30);
-    return GetCutsceneID() == CS_HTL_LAURA_PIANO && GetCutsceneTimer() >= 1600.0f;
+
+    bool second = (GetCutsceneID() == CS_HTL_LAURA_PIANO && GetCutsceneTimer() >= 1600.0f);
+
+    if (second)
+        WriteLog("FALSE POSITIVE detected: first check failed, second succeeded.");
+
+    return second;
 }
 
 static DWORD ReadTextscreenSafe()
@@ -426,6 +452,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
         if (sequenceIndex > maxSeq)
         {
             WriteLog("[END] Final sequence reached. Stopping audio and waiting for room/cutscene change...");
+            Sleep(12000);
             StopAlertSound();
 
             while (StabilizeCutscene())
