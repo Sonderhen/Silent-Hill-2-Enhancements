@@ -72,6 +72,7 @@ static const int MAX_SEQ_IDX = 11;
 
 static void WriteLog(const char* fmt, ...)
 {
+    // Only log if PlayUnusedAudio.log exists
     if (!g_enableLog) return;
     char buf[1024];
     va_list ap;
@@ -87,7 +88,6 @@ static void StopAlertSound()
     // caller must own g_audioLock
     if (g_pBuffer)
     {
-        // try stop
         g_pBuffer->Stop();
         g_pBuffer->Release();
         g_pBuffer = nullptr;
@@ -95,7 +95,7 @@ static void StopAlertSound()
     }
 }
 
-// Inicializa device DirectSound global
+// Initialize global DirectSound device only once.
 static bool EnsureDirectSoundInitialized()
 {
     if (!g_audioLockInitialized)
@@ -137,6 +137,7 @@ static bool LoadFileToMemory(const std::string& path, BYTE** outBuf, size_t* out
     *outBuf = buf; *outSize = size; return true;
 }
 
+// Applies master volume by multiplying every PCM sample.
 static void ApplyGameMasterVolume(BYTE* buffer, DWORD sizeBytes, float volume)
 {
     short* samples = (short*)buffer;
@@ -151,6 +152,7 @@ static void ApplyGameMasterVolume(BYTE* buffer, DWORD sizeBytes, float volume)
     }
 }
 
+// Create a DirectSound buffer and play the WAV PCM data.
 static bool PlayWavWithDirectSound(const WAVEFORMATEX* wf, const BYTE* audioData, DWORD audioSize)
 {
     if (!wf || !audioData || audioSize == 0)
@@ -161,6 +163,7 @@ static bool PlayWavWithDirectSound(const WAVEFORMATEX* wf, const BYTE* audioData
 
     AutoLock lock(&g_audioLock);
 
+    // Stop and destroy the previous buffer
     if (g_pBuffer)
     {
         g_pBuffer->Stop();
@@ -177,6 +180,7 @@ static bool PlayWavWithDirectSound(const WAVEFORMATEX* wf, const BYTE* audioData
     // RAII for new buffer
     ComReleaser<IDirectSoundBuffer> localBuffer;
 
+    // Create sound buffer
     HRESULT hr = g_pDS->CreateSoundBuffer(&desc, &localBuffer, nullptr);
     if (FAILED(hr))
     {
@@ -199,6 +203,7 @@ static bool PlayWavWithDirectSound(const WAVEFORMATEX* wf, const BYTE* audioData
 
     localBuffer->Unlock(p1, b1, p2, b2);
 
+    // Start playback
     hr = localBuffer->Play(0, 0, 0);
     if (FAILED(hr))
     {
@@ -214,6 +219,7 @@ static bool PlayWavWithDirectSound(const WAVEFORMATEX* wf, const BYTE* audioData
     return true;
 }
 
+// Releases DirectSound device and audio buffer safely.
 static void ReleaseDirectSoundDevice()
 {
     EnterCriticalSection(&g_audioLock);
@@ -228,6 +234,7 @@ static void ReleaseDirectSoundDevice()
     }
 }
 
+// Plays only a slice of a WAV file (start/end seconds).
 static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec, float endSec)
 {
     if (!wavBuf || wavSize < 44) {
@@ -235,6 +242,7 @@ static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec,
         return;
     }
 
+    // Extract format chunk
     uint32_t fmtSize = *(uint32_t*)(wavBuf + 16);
     WAVEFORMATEX* wf = (WAVEFORMATEX*)(wavBuf + 20);
 
@@ -243,6 +251,7 @@ static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec,
         return;
     }
 
+    // Locate PCM data
     DWORD dataPos = 20 + fmtSize + 8;
     if (dataPos >= wavSize) {
         WriteLog("PlayWavFromMemoryRange: dataPos >= wavSize");
@@ -253,6 +262,7 @@ static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec,
     DWORD audioSize = (DWORD)(wavSize - dataPos);
     DWORD frameBytes = (wf->wBitsPerSample / 8) * wf->nChannels;
 
+    // Convert seconds: byte offsets
     DWORD start = (DWORD)(startSec * wf->nSamplesPerSec * frameBytes);
     DWORD end = (DWORD)(endSec * wf->nSamplesPerSec * frameBytes);
 
@@ -267,11 +277,13 @@ static void PlayWavFromMemoryRange(BYTE* wavBuf, size_t wavSize, float startSec,
     BYTE* pcm = new BYTE[playLen];
     memcpy(pcm, audio + start, playLen);
 
+    // Apply in-game master volume
     float vol = EnableMasterVolume ? (float)ConfigData.VolumeLevel / 15.0f : 1.0f;
 
     if (wf->wFormatTag == WAVE_FORMAT_PCM && wf->wBitsPerSample == 16)
         ApplyGameMasterVolume(pcm, playLen, vol);
 
+    // Play extracted audio
     bool played = PlayWavWithDirectSound(wf, pcm, playLen);
 
     if (!played) {
@@ -334,6 +346,7 @@ static void ResetState(int& sequenceIndex, bool& active, bool& initializedAfterS
     initializedAfterStart = false;
 }
 
+// Load sequence timestamps for this specific cutscene.
 static void LoadSequenceTables(float* outStart, float* outEnd, int& outMax)
 {
     static const float start[SEQ_COUNT] = { 0.0f,7.2f,13.0f,17.1f,19.2f,22.5f,35.2f,47.2f,53.4f,61.2f,64.0f, 0.0f };
@@ -343,11 +356,13 @@ static void LoadSequenceTables(float* outStart, float* outEnd, int& outMax)
     outMax = MAX_SEQ_IDX;
 }
 
+// Detects the exact moment when the audio system should activate.
 static bool ShouldActivateSequence(DWORD room, DWORD cutscene, DWORD fade, float cutsceneTime)
 {
     return (room == R_HTL_RESTAURANT && cutscene == CS_HTL_LAURA_PIANO && fade == 3 && cutsceneTime >= 1600.000000);
 }
 
+// Prevent false positives by checking cutscene ID twice with a delay.
 static bool StabilizeCutscene() {
     bool first = (GetCutsceneID() == CS_HTL_LAURA_PIANO && GetCutsceneTimer() >= 1600.0f);
     if (first) return true;
@@ -397,6 +412,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
         DWORD fade = GetTransitionState();
         float cutsceneTime = GetCutsceneTimer();
 
+        // If leaving the restaurant, reset everything.
         if (room != R_HTL_RESTAURANT)
         {
             ResetState(sequenceIndex, active, initializedAfterStart);
@@ -407,6 +423,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
 
         LoadSequenceTables(seqStart, seqEnd, maxSeq);
 
+        // Activation phase — waiting for the exact trigger.
         if (!active)
         {
             if (ShouldActivateSequence(room, cutscene, fade, cutsceneTime))
@@ -423,6 +440,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
             }
         }
 
+        // Cutscene might have changed — double-check.
         if (!StabilizeCutscene()) {
             WriteLog("Cutscene unstable. Resetting.");
             ResetState(sequenceIndex, active, initializedAfterStart);
@@ -431,6 +449,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
 
         DWORD value = ReadTextscreenSafe();
 
+        // First value after activation becomes baseline.
         if (!initializedAfterStart)
         {
             WriteLog("[INIT] First read after activation: lastTextValue=%u", value);
@@ -440,6 +459,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
             continue;
         }
 
+        // Detect change: play the next audio slice.
         if (value != 0 && value != lastTextValue)
         {
             WriteLog("[PLAY] Change detected: last=%u : value=%u (seq=%d)", lastTextValue, value, sequenceIndex);
@@ -449,12 +469,14 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
             sequenceIndex++;
         }
 
+        // All sequences finished
         if (sequenceIndex > maxSeq)
         {
             WriteLog("[END] Final sequence reached. Stopping audio and waiting for room/cutscene change...");
             Sleep(12000);
             StopAlertSound();
 
+            // Wait until cutscene actually changes
             while (StabilizeCutscene())
             {
                 if (!GetModuleHandleA(selfName))
@@ -476,6 +498,7 @@ DWORD WINAPI AudioMonitorThread(LPVOID)
     return 0;
 }
 
+// Entry point: locate memory address, verify AFS, start monitor thread.
 void PatchUnusedAudio()
 {
     BYTE pattern[] = { 0xA3, 0xEC, 0x03, 0xF6, 0x01 };
